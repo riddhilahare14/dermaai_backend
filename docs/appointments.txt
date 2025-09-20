@@ -1,0 +1,138 @@
+# modules/appointments/models.py
+from sqlalchemy import Column, Integer, ForeignKey, String, DateTime, JSON
+from sqlalchemy.orm import relationship
+from modules.core.db import Base
+import datetime
+
+class Appointment(Base):
+    __tablename__ = "appointments"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("patients.id", ondelete="CASCADE"), nullable=False)
+    doctor_id = Column(Integer, ForeignKey("doctors.id", ondelete="CASCADE"), nullable=False)
+    slot_id = Column(Integer, ForeignKey("doctor_slots.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String, default="scheduled")  # scheduled, completed, cancelled
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    scheduled_at = Column(DateTime, nullable=False)
+
+    # Agora-related fields
+    channel_name = Column(String, nullable=True)
+    agora_token = Column(String, nullable=True)
+
+    patient = relationship("Patient")
+    doctor = relationship("Doctor")
+    slot = relationship("DoctorSlot")
+
+
+# modules/appointments/schemas.py
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+class AppointmentRequest(BaseModel):
+    infection_record_id: Optional[int] = None  # optional reference to infection result
+    preferred_specialization: Optional[str] = None  # optional filter
+
+class AppointmentOut(BaseModel):
+    id: int
+    patient_id: int
+    doctor_id: int
+    slot_id: int
+    status: str
+    scheduled_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# modules/appointments/crud.py
+from sqlalchemy.orm import Session
+from modules.doctors.models import Doctor, DoctorSlot
+from modules.appointments.models import Appointment
+from modules.doctors import crud as doctor_crud
+from modules.core import agora_utils
+from datetime import datetime
+import uuid
+
+def book_earliest_slot_across_doctors(db: Session, patient_id: int, preferred_specialization: str | None = None):
+    """
+    Booking algorithm:
+    - get doctors (optionally filtered by specialization) ordered by ID (sequential).
+    - for each doctor: find the earliest unbooked slot (start >= now).
+    - reserve the first found slot by setting is_booked True and creating an Appointment.
+    NOTE: This is a simple approach. For concurrency use DB-level locks or SELECT ... FOR UPDATE.
+    """
+    now = datetime.utcnow()
+    query = db.query(Doctor)
+    if preferred_specialization:
+        query = query.filter(Doctor.specialization == preferred_specialization)
+    doctors = query.order_by(Doctor.id).all()
+
+    for doc in doctors:
+        # find earliest unbooked slot for this doctor
+        slot = (
+            db.query(DoctorSlot)
+            .filter(DoctorSlot.doctor_id == doc.id, DoctorSlot.is_booked == False, DoctorSlot.start_datetime >= now)
+            .order_by(DoctorSlot.start_datetime)
+            .with_for_update()  # try to lock row where supported
+            .first()
+        )
+        if slot:
+            slot.is_booked = True
+            # generate Agora channel
+            channel_name = f"appt_{uuid.uuid4().hex[:8]}"
+            patient_token = agora_utils.generate_agora_token(channel_name, patient_id)
+            doctor_token = agora_utils.generate_agora_token(channel_name, doc.id)
+
+            appt = Appointment(
+                patient_id=patient_id,
+                doctor_id=doc.id,
+                slot_id=slot.id,
+                scheduled_at=slot.start_datetime,
+                status="scheduled",
+                channel_name=channel_name,
+                agora_token=patient_token  # store one token or generate fresh on request
+            )
+            db.add(appt)
+            db.commit()
+            db.refresh(appt)
+            return appt
+    return None
+
+
+# modules/appointments/routes.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from modules.core.db import get_db
+from modules.auth.security import get_current_user
+from modules.users.models import User
+from modules.appointments import schemas, crud as appt_crud
+from modules.patients import crud as patient_crud
+from modules.core import agora_utils
+
+router = APIRouter(prefix="/appointments", tags=["appointments"])
+
+@router.post("/request", response_model=schemas.AppointmentOut)
+def request_appointment(payload: schemas.AppointmentRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "patient":
+        raise HTTPException(status_code=403, detail="Only patients can request appointments")
+    patient = patient_crud.get_patient_by_user_id(db, current_user.id)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient profile not found")
+    appt = appt_crud.book_earliest_slot_across_doctors(db, patient.id, preferred_specialization=payload.preferred_specialization)
+    if not appt:
+        raise HTTPException(status_code=404, detail="No available slots found")
+    return appt
+
+@router.get("/{appointment_id}/token")
+def get_agora_token(appointment_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    appt = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    
+    # Only patient or doctor of this appointment
+    if appt.patient.user_id != current_user.id and appt.doctor.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    uid = current_user.id
+    token = agora_utils.generate_agora_token(appt.channel_name, uid)
+
+    return {"channel_name": appt.channel_name, "token": token, "uid": uid}

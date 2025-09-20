@@ -1,0 +1,127 @@
+# modules/infections/models.py
+from sqlalchemy import Column, Integer, ForeignKey, String, DateTime, JSON, Float, Boolean
+from sqlalchemy.orm import relationship
+from modules.core.db import Base
+import datetime
+
+class InfectionRecord(Base):
+    __tablename__ = "infection_records"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("patients.id", ondelete="CASCADE"), nullable=False)
+    image_url = Column(String, nullable=False)
+    ai_response = Column(JSON, nullable=True)  # JSON dump as text
+    diagnosis = Column(String, nullable=True)
+    confidence = Column(Float, nullable=True)
+    recommended_consultation = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    patient = relationship("Patient")
+
+
+# modules/infections/schemas.py
+from pydantic import BaseModel
+from typing import Optional
+
+class DiagnoseResponse(BaseModel):
+    id: int
+    diagnosis: Optional[str]
+    confidence: Optional[float]
+    ai_response: Optional[str]
+    recommended_consultation: bool
+
+    model_config = {"from_attributes": True}
+
+
+# modules/infections/crud.py
+from sqlalchemy.orm import Session
+from modules.infections.models import InfectionRecord
+import json
+
+def create_infection_record(db: Session, patient_id: int, image_url: str, ai_response: dict | None = None, diagnosis: str | None = None, confidence: float | None = None, recommended_consultation: bool = False):
+    record = InfectionRecord(
+        patient_id=patient_id,
+        image_url=image_url,
+        ai_response=json.dumps(ai_response) if ai_response else None,
+        diagnosis=diagnosis,
+        confidence=confidence,
+        recommended_consultation=recommended_consultation
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+def get_infection_by_id(db: Session, record_id: int):
+    return db.query(InfectionRecord).filter(InfectionRecord.id == record_id).first()
+
+
+# modules/infections/routes.py
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from sqlalchemy.orm import Session
+from modules.core.db import get_db
+from modules.auth.security import get_current_user
+from modules.users.models import User
+from modules.patients import crud as patient_crud
+from modules.infections import crud, schemas
+from modules.core import cloudinary_utils
+from modules.appointments import crud as appt_crud
+
+router = APIRouter(prefix="/infections", tags=["infections"])
+
+# helper: dummy AI call - replace with real integration
+def call_ai_model_on_image_bytes(image_bytes: bytes):
+    # Dummy: return a sample response. Replace with real API call:
+    return {
+        "diagnosis": "Possible fungal infection",
+        "confidence": 0.86,
+        "advice": "Apply anti-fungal cream twice daily for 2 weeks. Consult a dermatologist if it persists."
+    }
+
+@router.post("/diagnose", response_model=schemas.DiagnoseResponse)
+def diagnose_infection(image: UploadFile = File(...), notes: str | None = Form(None), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "patient":
+        raise HTTPException(status_code=403, detail="Only patients can use diagnose feature")
+    patient = patient_crud.get_patient_by_user_id(db, current_user.id)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient profile not found")
+
+    # upload image to Cloudinary (or local)
+    image_url = cloudinary_utils.upload_file_to_cloudinary(image)
+
+    # read bytes and send to AI
+    contents = image.file.read()
+    ai_resp = call_ai_model_on_image_bytes(contents)
+
+    # decide if we recommend consultation (simple rule: confidence < threshold OR serious tags)
+    recommend = ai_resp.get("confidence", 1.0) < 0.9  # example heuristic
+    record = crud.create_infection_record(db, patient.id, image_url, ai_response=ai_resp, diagnosis=ai_resp.get("diagnosis"), confidence=ai_resp.get("confidence"), recommended_consultation=recommend)
+
+    return {
+        "id": record.id,
+        "diagnosis": record.diagnosis,
+        "confidence": record.confidence,
+        "ai_response": str(ai_resp),
+        "recommended_consultation": record.recommended_consultation
+    }
+
+# If patient wants consultation for a given infection record
+@router.post("/{record_id}/consult", response_model=schemas.DiagnoseResponse)
+def request_consult(record_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "patient":
+        raise HTTPException(status_code=403, detail="Only patients")
+    record = crud.get_infection_by_id(db, record_id)
+    if not record or record.patient.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Record not found or not yours")
+
+    # Try booking appointment (no specialization filter here, or set based on diagnosis)
+    appt = appt_crud.book_earliest_slot_across_doctors(db, record.patient_id, preferred_specialization=None)
+    if not appt:
+        raise HTTPException(status_code=404, detail="No available slots to book")
+    # Optionally update record to link appointment (not modeled)
+    return {
+        "id": record.id,
+        "diagnosis": record.diagnosis,
+        "confidence": record.confidence,
+        "ai_response": record.ai_response,
+        "recommended_consultation": True
+    }
