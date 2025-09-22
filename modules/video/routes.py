@@ -1,3 +1,4 @@
+# modules/video/routes.py
 from fastapi import APIRouter, Depends, HTTPException
 from modules.core.agora_utils import generate_agora_token
 from modules.auth.security import get_current_user
